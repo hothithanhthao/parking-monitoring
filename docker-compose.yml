@@ -1,0 +1,76 @@
+version: '3'
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - mynetwork
+
+  redis:
+    image: redis:latest
+    container_name: redis_db
+    ports:
+      - "6379:6379"
+    networks:
+      - mynetwork
+
+  entry_service:
+    build: ./entry_service
+    container_name: entry_service
+    volumes:
+      - ./entry_service:/app
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    networks:
+      - mynetwork
+
+  exit_service:
+    build: ./exit_service
+    container_name: exit_service
+    volumes:
+      - ./exit_service:/app
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    networks:
+      - mynetwork
+
+  consume_service:
+    build: ./consume_service
+    container_name: consume_service
+    volumes:
+      - ./consume_service:/app
+    depends_on:
+      - rabbitmq
+      - redis
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - REDIS_HOST=redis
+      - PYTHON_API_URL=http://api:5000
+    networks:
+      - mynetwork
+
+  api:
+    build: ./api
+    container_name: api
+    volumes:
+      - ./api:/app
+    depends_on:
+      - redis
+    ports:
+      - "5000:5000"
+    networks:
+      - mynetwork
+
+networks:
+  mynetwork:
+    driver: bridge
