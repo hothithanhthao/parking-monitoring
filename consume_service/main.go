@@ -4,19 +4,30 @@ import (
     "log"
     "encoding/json"
     "fmt"
-    "github.com/go-redis/redis/v8"
-    "github.com/streadway/amqp"
-    "golang.org/x/net/context"
     "net/http"
     "bytes"
     "time"
+    "os"
+    "github.com/go-redis/redis/v8"
+    "github.com/streadway/amqp"
+    "golang.org/x/net/context"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var ctx = context.Background()
 
-// Counters for matched and unmatched events
-var matchedCount int
-var unmatchedCount int
+// Prometheus metrics
+var (
+    matchedEvents = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "matched_events",
+        Help: "Number of matched exit events",
+    })
+    unmatchedEvents = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "unmatched_events",
+        Help: "Number of unmatched exit events",
+    })
+)
 
 // Structs for Entry and Exit Events
 type EntryEvent struct {
@@ -34,11 +45,18 @@ type ExitEvent struct {
 // Struct to log vehicle data via REST API
 type VehicleLog struct {
     VehiclePlate  string    `json:"vehicle_plate"`
-    EntryDateTime string    `json:"entry_date_time"` // Send as string in RFC3339Nano format
-    ExitDateTime  string    `json:"exit_date_time"`  // Send as string in RFC3339Nano format
+    EntryDateTime string    `json:"entry_date_time"`
+    ExitDateTime  string    `json:"exit_date_time"`
 }
 
-// Declaring ExitQueue and Consuming Messages
+// consumeExitQueue consumes messages from the "ExitQueue" in RabbitMQ, processes exit events,
+// and matches them with corresponding entry events stored in Redis. If a match is found, it sends
+// the vehicle log to a REST API and removes the entry from Redis.
+//
+// Parameters:
+// - conn: The RabbitMQ connection.
+// - rdb: The Redis client.
+// - apiUrl: The URL of the REST API to send vehicle logs to.
 func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
     ch, err := conn.Channel()
     if err != nil {
@@ -48,12 +66,12 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
 
     // Declare the ExitQueue
     queue, err := ch.QueueDeclare(
-        "ExitQueue", // queue name
-        true,        // durable
-        false,       // delete when unused
-        false,       // exclusive
-        false,       // no-wait
-        nil,         // arguments
+        "ExitQueue",
+        true,
+        false,
+        false,
+        false,
+        nil,
     )
     if err != nil {
         log.Fatalf("Failed to declare queue: %s", err)
@@ -61,13 +79,13 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
     log.Printf("Declared queue: %s", queue.Name)
 
     msgs, err := ch.Consume(
-        "ExitQueue", // queue
-        "",          // consumer
-        true,        // auto-ack
-        false,       // exclusive
-        false,       // no-local
-        false,       // no-wait
-        nil,         // args
+        "ExitQueue",
+        "",
+        true,
+        false,
+        false,
+        false,
+        nil,
     )
     if err != nil {
         log.Fatalf("Failed to register a consumer: %s", err)
@@ -85,16 +103,14 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
         entryTimeStr, err := rdb.Get(ctx, exitEvent.VehiclePlate).Result()
         if err != nil {
             // No matching entry event found (20%)
-            unmatchedCount++
+            unmatchedEvents.Inc()
             fmt.Printf("No entry event found for vehicle plate %s (Unmatched)\n", exitEvent.VehiclePlate)
-            log.Printf("Unmatched Count: %d, Matched Count: %d\n", unmatchedCount, matchedCount)
             continue
         }
 
         // Matching entry event found (80%)
-        matchedCount++
+        matchedEvents.Inc()
         fmt.Printf("Found matching entry time for vehicle plate %s\n", exitEvent.VehiclePlate)
-        log.Printf("Unmatched Count: %d, Matched Count: %d\n", unmatchedCount, matchedCount)
 
         // Parse the entry time from Redis with RFC3339Nano format
         entryTime, err := time.Parse(time.RFC3339Nano, entryTimeStr)
@@ -118,7 +134,11 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
     }
 }
 
-// Send vehicle log to REST API
+// sendToRestAPI sends the vehicle log to a REST API using an HTTP POST request.
+//
+// Parameters:
+// - log: The vehicle log to send.
+// - apiUrl: The URL of the REST API.
 func sendToRestAPI(log VehicleLog, apiUrl string) {
     jsonData, err := json.Marshal(log)
     if err != nil {
@@ -140,34 +160,61 @@ func sendToRestAPI(log VehicleLog, apiUrl string) {
     }
 }
 
-// Connect to RabbitMQ with retries
+// Connect to RabbitMQ with 5 times retry
 func connectRabbitMQ() *amqp.Connection {
-    var conn *amqp.Connection
-    var err error
+	rabbitMQHost := os.Getenv("RABBITMQ_HOST")
+	rabbitMQPort := os.Getenv("RABBITMQ_PORT")
 
-    for i := 0; i < 5; i++ { // Retry 5 times
-        conn, err = amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
-        if err == nil {
-            return conn
-        }
-        log.Printf("Failed to connect to RabbitMQ, retrying in 5 seconds... (%d/5)", i+1)
-        time.Sleep(5 * time.Second)
+	if rabbitMQHost == "" || rabbitMQPort == "" {
+        log.Fatal("Environment variables RABBITMQ_HOST or RABBITMQ_PORT are not set")
     }
 
-    log.Fatalf("Could not connect to RabbitMQ after 5 attempts: %s", err)
-    return nil
+	var conn *amqp.Connection
+	var err error
+
+	for i := 0; i < 5; i++ { // Retry 5 times
+		conn, err = amqp.Dial(fmt.Sprintf("amqp://guest:guest@%s:%s", rabbitMQHost, rabbitMQPort))
+		if err == nil {
+			return conn
+		}
+		log.Printf("Failed to connect to RabbitMQ, retrying in 5 seconds... (%d/5)", i+1)
+		time.Sleep(5 * time.Second)
+	}
+
+	log.Fatalf("Could not connect to RabbitMQ after 5 attempts: %s", err)
+	return nil
 }
 
 // Connect to Redis
 func connectRedis() *redis.Client {
-    rdb := redis.NewClient(&redis.Options{
-        Addr: "redis:6379", // Redis container address
-        DB:   0,            // Use default DB
-    })
-    return rdb
+	redisHost := os.Getenv("REDIS_HOST")
+    redisPort := os.Getenv("REDIS_PORT")
+
+    if redisHost == "" || redisPort == "" {
+        log.Fatal("Environment variables REDIS_HOST or REDIS_PORT are not set")
+    }
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+		DB:   0,
+	})
+	return rdb
+}
+
+// Setup Prometheus Metrics Endpoint
+func setupMetrics() {
+    prometheus.MustRegister(matchedEvents)
+    prometheus.MustRegister(unmatchedEvents)
+
+    http.Handle("/metrics", promhttp.Handler())
+    go func() {
+        log.Fatal(http.ListenAndServe(":2112", nil)) // Expose metrics on port 2112
+    }()
 }
 
 func main() {
+    setupMetrics()
+
     conn := connectRabbitMQ()
     defer conn.Close()
 
@@ -175,10 +222,8 @@ func main() {
 
     log.Println("Successfully connected to RabbitMQ and Redis")
 
-    // Consume exit events asynchronously
-    apiUrl := "http://api:5000"
+    apiUrl := os.Getenv("PYTHON_API_URL")
     go consumeExitQueue(conn, rdb, apiUrl)
 
-    // Keep the service running
     select {}
 }

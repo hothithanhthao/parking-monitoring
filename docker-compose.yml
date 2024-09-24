@@ -29,6 +29,9 @@ services:
       - rabbitmq
     environment:
       - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     networks:
       - mynetwork
 
@@ -41,6 +44,9 @@ services:
       - rabbitmq
     environment:
       - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     networks:
       - mynetwork
 
@@ -54,10 +60,14 @@ services:
       - redis
     environment:
       - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
       - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - PYTHON_API_URL=http://api:5000
     networks:
       - mynetwork
+    ports:
+      - "2112:2112"
 
   api:
     build: ./api
@@ -68,6 +78,31 @@ services:
       - redis
     ports:
       - "5000:5000"
+    networks:
+      - mynetwork
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - mynetwork
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
     networks:
       - mynetwork
 

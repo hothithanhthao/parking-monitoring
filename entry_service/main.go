@@ -3,18 +3,20 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/streadway/amqp"
-	"math/rand"
-	"time"
 	"log"
+	"math/rand"
+	"os"
+	"time"
+
 	"github.com/go-redis/redis/v8"
+	"github.com/streadway/amqp"
 	"golang.org/x/net/context"
 )
 
 type EntryEvent struct {
 	ID            string `json:"id"`
 	VehiclePlate  string `json:"vehicle_plate"`
-	EntryDateTime string `json:"entry_date_time"` // String to hold formatted datetime
+	EntryDateTime string `json:"entry_date_time"`
 }
 
 var ctx = context.Background()
@@ -22,13 +24,16 @@ var ctx = context.Background()
 // Simulate random entry event generation
 func generateEntryEvent() EntryEvent {
 	return EntryEvent{
-		ID:            fmt.Sprintf("entry-%d", rand.Intn(100000)),       // Random unique ID for entry event
-		VehiclePlate:  fmt.Sprintf("ABC%d", rand.Intn(999)),            // Random alphanumeric plate
-		EntryDateTime: time.Now().UTC().Format(time.RFC3339Nano),       // Format entry time as RFC3339Nano
+		ID:            fmt.Sprintf("entry-%d", rand.Intn(100000)),
+		VehiclePlate:  fmt.Sprintf("ABC%d", rand.Intn(999)),
+		EntryDateTime: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }
 
 // Store entry in Redis for later retrieval by the exit generator
+// Parameters:
+// - rdb: The Redis client.
+// - event: The EntryEvent to store.
 func storeEntryInRedis(rdb *redis.Client, event EntryEvent) {
 	err := rdb.Set(ctx, event.VehiclePlate, event.EntryDateTime, 0).Err()
 	if err != nil {
@@ -39,6 +44,10 @@ func storeEntryInRedis(rdb *redis.Client, event EntryEvent) {
 }
 
 // Send the event to RabbitMQ
+// Parameters:
+// - conn: The RabbitMQ connection.
+// - queueName: The name of the queue to send the event to.
+// - event: The EntryEvent to send.
 func sendToQueue(conn *amqp.Connection, queueName string, event EntryEvent) error {
 	ch, err := conn.Channel()
 	if err != nil {
@@ -81,13 +90,20 @@ func sendToQueue(conn *amqp.Connection, queueName string, event EntryEvent) erro
 	return nil
 }
 
-// Connect to RabbitMQ with retries
+// Connect to RabbitMQ with 5 times retry
 func connectRabbitMQ() *amqp.Connection {
+	rabbitMQHost := os.Getenv("RABBITMQ_HOST")
+	rabbitMQPort := os.Getenv("RABBITMQ_PORT")
+
+	if rabbitMQHost == "" || rabbitMQPort == "" {
+		log.Fatal("Environment variables RABBITMQ_HOST or RABBITMQ_PORT are not set")
+	}
+
 	var conn *amqp.Connection
 	var err error
 
 	for i := 0; i < 5; i++ { // Retry 5 times
-		conn, err = amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
+		conn, err = amqp.Dial(fmt.Sprintf("amqp://guest:guest@%s:%s", rabbitMQHost, rabbitMQPort))
 		if err == nil {
 			return conn
 		}
@@ -101,9 +117,16 @@ func connectRabbitMQ() *amqp.Connection {
 
 // Connect to Redis
 func connectRedis() *redis.Client {
+	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+
+	if redisHost == "" || redisPort == "" {
+		log.Fatal("Environment variables REDIS_HOST or REDIS_PORT are not set")
+	}
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "redis:6379", // Redis container address
-		DB:   0,            // use default DB
+		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+		DB:   0,
 	})
 	return rdb
 }
@@ -117,19 +140,15 @@ func main() {
 	log.Println("Successfully connected to RabbitMQ and Redis")
 
 	for {
-		// Generate a random entry event
 		entryEvent := generateEntryEvent()
 
-		// Store event in Redis
 		storeEntryInRedis(rdb, entryEvent)
 
-		// Send event to RabbitMQ entry queue
 		err := sendToQueue(conn, "EntryQueue", entryEvent)
 		if err != nil {
 			fmt.Println("Failed to send entry event:", err)
 		}
 
-		// Sleep for 5 seconds to simulate time between events
 		time.Sleep(5 * time.Second)
 	}
 }
