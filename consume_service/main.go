@@ -27,6 +27,11 @@ var (
         Name: "unmatched_events",
         Help: "Number of unmatched exit events",
     })
+    eventProcessingDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+        Name:    "event_processing_duration_seconds",
+        Help:    "Histogram for the duration of event processing in seconds",
+        Buckets: prometheus.DefBuckets,
+    })
 )
 
 // Structs for Entry and Exit Events
@@ -92,6 +97,8 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
     }
 
     for msg := range msgs {
+        start := time.Now()
+
         var exitEvent ExitEvent
         err := json.Unmarshal(msg.Body, &exitEvent)
         if err != nil {
@@ -112,14 +119,12 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
         matchedEvents.Inc()
         fmt.Printf("Found matching entry time for vehicle plate %s\n", exitEvent.VehiclePlate)
 
-        // Parse the entry time from Redis with RFC3339Nano format
         entryTime, err := time.Parse(time.RFC3339Nano, entryTimeStr)
         if err != nil {
             fmt.Printf("Failed to parse entry time for vehicle plate %s: %s\n", exitEvent.VehiclePlate, err)
             continue
         }
 
-        // Prepare vehicle log with RFC3339Nano format for sending to REST API
         vehicleLog := VehicleLog{
             VehiclePlate:  exitEvent.VehiclePlate,
             EntryDateTime: entryTime.UTC().Format(time.RFC3339Nano),
@@ -131,6 +136,10 @@ func consumeExitQueue(conn *amqp.Connection, rdb *redis.Client, apiUrl string) {
 
         // Remove the entry from Redis
         rdb.Del(ctx, exitEvent.VehiclePlate)
+
+        // Measure the duration and observe it in the histogram
+        duration := time.Since(start).Seconds()
+        eventProcessingDuration.Observe(duration)
     }
 }
 
@@ -205,10 +214,11 @@ func connectRedis() *redis.Client {
 func setupMetrics() {
     prometheus.MustRegister(matchedEvents)
     prometheus.MustRegister(unmatchedEvents)
+    prometheus.MustRegister(eventProcessingDuration)
 
     http.Handle("/metrics", promhttp.Handler())
     go func() {
-        log.Fatal(http.ListenAndServe(":2112", nil)) // Expose metrics on port 2112
+        log.Fatal(http.ListenAndServe(":2112", nil))
     }()
 }
 
